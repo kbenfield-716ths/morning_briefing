@@ -34,7 +34,13 @@ from typing import Optional
 # ICS Calendar feeds (set as GitHub secrets)
 OUTLOOK_ICS_URL = os.environ.get("OUTLOOK_ICS_URL", "")
 QGENDA_ICS_URL = os.environ.get("QGENDA_ICS_URL", "")
-PERSONAL_ICS_URL = os.environ.get("PERSONAL_ICS_URL", "")
+
+# Personal/family calendars — supports multiple feeds
+# Format: JSON object mapping label → ICS URL
+# Example: {"My Calendar":"https://...","Liam School":"https://...","Annalise School":"https://..."}
+# OR: a single URL string for backward compatibility
+PERSONAL_CALENDARS_JSON = os.environ.get("PERSONAL_CALENDARS", "")
+PERSONAL_ICS_URL = os.environ.get("PERSONAL_ICS_URL", "")  # legacy single-feed fallback
 
 # Weather location (default: Charlottesville, VA)
 WEATHER_LAT = float(os.environ.get("WEATHER_LAT", "38.03"))
@@ -193,6 +199,42 @@ def fetch_calendar_events(ics_url: str, label: str, target_date: datetime) -> li
         return []
 
 
+def fetch_personal_calendars(target_date: datetime) -> list[dict]:
+    """
+    Fetch events from all personal/family calendars.
+    
+    Supports two config styles:
+      1. PERSONAL_CALENDARS secret as JSON: {"Label":"url", "Label2":"url2", ...}
+      2. Legacy PERSONAL_ICS_URL secret as a single URL string
+    """
+    all_events = []
+    
+    # Try the multi-calendar JSON format first
+    if PERSONAL_CALENDARS_JSON:
+        try:
+            calendars = json.loads(PERSONAL_CALENDARS_JSON)
+            if isinstance(calendars, dict):
+                for label, url in calendars.items():
+                    events = fetch_calendar_events(url.strip(), label.strip(), target_date)
+                    all_events.extend(events)
+                return all_events
+        except json.JSONDecodeError:
+            print("⚠ PERSONAL_CALENDARS is not valid JSON, trying as comma-separated URLs")
+            # Fallback: treat as comma-separated URLs
+            urls = [u.strip() for u in PERSONAL_CALENDARS_JSON.split(",") if u.strip()]
+            for i, url in enumerate(urls):
+                label = f"Personal {i+1}" if len(urls) > 1 else "Personal"
+                events = fetch_calendar_events(url, label, target_date)
+                all_events.extend(events)
+            return all_events
+    
+    # Legacy single-URL fallback
+    if PERSONAL_ICS_URL:
+        return fetch_calendar_events(PERSONAL_ICS_URL, "Personal", target_date)
+    
+    return []
+
+
 def fetch_weather() -> dict:
     """Fetch today's weather from Open-Meteo (free, no API key)."""
     try:
@@ -297,68 +339,108 @@ def format_briefing(
     qgenda_events: list,
     personal_events: list,
     headlines: list
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """
-    Format the briefing as (title, body).
-    Returns plain text optimized for push notification readability.
+    Format the briefing as (title, html_body, plain_body).
+    Returns HTML for Pushover and plain text for Ntfy/logging.
     """
     day_name = today.strftime("%A")
     date_str = today.strftime("%B %-d")
     
     title = f"☀️ {day_name}, {date_str}"
     
-    sections = []
+    html = []
+    plain = []
     
-    # Weather
+    # ── Weather ──
     if weather:
         w = weather
-        weather_line = f"{w['description']}  {w['low']}{w['unit']}→{w['high']}{w['unit']}"
-        if w.get("precip_chance", 0) > 20:
-            weather_line += f"  🌧 {w['precip_chance']}%"
-        sections.append(weather_line)
+        temp = f"{w['low']}{w['unit']} → {w['high']}{w['unit']}"
+        rain = f"  ·  🌧 {w['precip_chance']}%" if w.get("precip_chance", 0) > 20 else ""
+        html.append(f"<b>{w['description']}</b>  {temp}{rain}")
+        plain.append(f"{w['description']}  {temp}{rain}")
     
-    # QGenda (clinical schedule — show first)
-    if qgenda_events:
-        lines = ["📋 Clinical:"]
-        for e in qgenda_events:
-            loc = f" ({e['location']})" if e.get("location") else ""
-            lines.append(f"  {e['time']}  {e['summary']}{loc}")
-        sections.append("\n".join(lines))
+    # ── WORK section ──
+    if qgenda_events or outlook_events:
+        html.append("\n<b>━━ WORK ━━</b>")
+        plain.append("━━ WORK ━━")
+        
+        if qgenda_events:
+            html.append("📋 <b>Clinical</b>")
+            plain.append("📋 Clinical:")
+            for e in qgenda_events:
+                loc = f" ({e['location']})" if e.get("location") else ""
+                html.append(f"  <b>{e['time']}</b>  {e['summary']}{loc}")
+                plain.append(f"  {e['time']}  {e['summary']}{loc}")
+        
+        if outlook_events:
+            if qgenda_events:
+                html.append("")
+            html.append("📅 <b>Meetings</b>")
+            plain.append("📅 Meetings:")
+            for e in outlook_events:
+                loc = f" ({e['location']})" if e.get("location") else ""
+                html.append(f"  <b>{e['time']}</b>  {e['summary']}{loc}")
+                plain.append(f"  {e['time']}  {e['summary']}{loc}")
     
-    # Outlook (meetings/admin)
-    if outlook_events:
-        lines = ["📅 Meetings:"]
-        for e in outlook_events:
-            loc = f" ({e['location']})" if e.get("location") else ""
-            lines.append(f"  {e['time']}  {e['summary']}{loc}")
-        sections.append("\n".join(lines))
-    
-    # Personal
+    # ── PERSONAL section ──
     if personal_events:
-        lines = ["🏠 Personal:"]
+        html.append("\n<b>━━ PERSONAL ━━</b>")
+        plain.append("━━ PERSONAL ━━")
+        
+        # Group events by source label (e.g., "My Calendar", "Liam School")
+        sources: dict[str, list] = {}
         for e in personal_events:
-            loc = f" ({e['location']})" if e.get("location") else ""
-            lines.append(f"  {e['time']}  {e['summary']}{loc}")
-        sections.append("\n".join(lines))
+            src = e.get("source", "Personal")
+            if src not in sources:
+                sources[src] = []
+            sources[src].append(e)
+        
+        first = True
+        for source_label, events in sources.items():
+            if not first:
+                html.append("")
+            first = False
+            
+            # Show sub-header when multiple calendars
+            if len(sources) > 1:
+                html.append(f"🏠 <b>{source_label}</b>")
+                plain.append(f"🏠 {source_label}:")
+            else:
+                html.append("🏠 <b>Personal</b>")
+                plain.append("🏠 Personal:")
+            
+            for e in events:
+                loc = f" ({e['location']})" if e.get("location") else ""
+                html.append(f"  <b>{e['time']}</b>  {e['summary']}{loc}")
+                plain.append(f"  {e['time']}  {e['summary']}{loc}")
     
-    # No events at all
+    # No events
     if not qgenda_events and not outlook_events and not personal_events:
-        sections.append("📅 No events on calendar today.")
+        html.append("📅 No events on calendar today.")
+        plain.append("📅 No events on calendar today.")
     
-    # Headlines
+    # ── Headlines ──
     if headlines:
-        sections.append("📰 " + headlines[0]["title"][:120])
+        hl = headlines[0]
+        hl_text = hl["title"][:120]
+        if hl.get("link"):
+            html.append(f"\n📰 <a href=\"{hl['link']}\">{hl_text}</a>")
+        else:
+            html.append(f"\n📰 {hl_text}")
+        plain.append(f"📰 {hl_text}")
     
-    body = "\n\n".join(sections)
-    return title, body
+    html_body = "\n".join(html)
+    plain_body = "\n\n".join(plain)
+    return title, html_body, plain_body
 
 
 # ──────────────────────────────────────────────────────────────
 # NOTIFICATION DELIVERY
 # ──────────────────────────────────────────────────────────────
 
-def send_pushover(title: str, body: str):
-    """Send notification via Pushover."""
+def send_pushover(title: str, html_body: str):
+    """Send HTML-formatted notification via Pushover."""
     if not PUSHOVER_USER_KEY or not PUSHOVER_APP_TOKEN:
         print("⚠ Pushover credentials not configured, skipping.")
         return
@@ -367,8 +449,9 @@ def send_pushover(title: str, body: str):
         "token": PUSHOVER_APP_TOKEN,
         "user": PUSHOVER_USER_KEY,
         "title": title,
-        "message": body,
-        "priority": 0,  # Normal priority
+        "message": html_body,
+        "html": 1,          # Enable HTML rendering
+        "priority": 0,
         "sound": "morning",
     }).encode("utf-8")
     
@@ -424,23 +507,23 @@ def main():
     
     outlook_events = fetch_calendar_events(OUTLOOK_ICS_URL, "Outlook", today)
     qgenda_events = fetch_calendar_events(QGENDA_ICS_URL, "QGenda", today)
-    personal_events = fetch_calendar_events(PERSONAL_ICS_URL, "Personal", today)
+    personal_events = fetch_personal_calendars(today)
     
     headlines = fetch_rss_headlines(max_per_feed=1)
     
     # Format
-    title, body = format_briefing(
+    title, html_body, plain_body = format_briefing(
         today, weather, outlook_events, qgenda_events, personal_events, headlines
     )
     
-    print(f"\n{title}\n{body}\n")
+    print(f"\n{title}\n{plain_body}\n")
     
     # Deliver
     method = NOTIFY_METHOD.lower()
     if method in ("pushover", "both"):
-        send_pushover(title, body)
+        send_pushover(title, html_body)
     if method in ("ntfy", "both"):
-        send_ntfy(title, body)
+        send_ntfy(title, plain_body)
     
     print("\n✓ Briefing complete.")
 
