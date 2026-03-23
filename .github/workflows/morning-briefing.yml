@@ -1,0 +1,55 @@
+name: Morning Briefing
+
+on:
+  schedule:
+    # 6:00 AM Eastern = 10:00 AM UTC (EDT) or 11:00 AM UTC (EST)
+    # Using 10:00 UTC — adjust to 11:00 in winter if needed
+    - cron: '0 10 * * *'
+  
+  # Allow manual trigger for testing
+  workflow_dispatch:
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Run Morning Briefing
+        env:
+          # Calendar ICS feeds
+          OUTLOOK_ICS_URL: ${{ secrets.OUTLOOK_ICS_URL }}
+          QGENDA_ICS_URL: ${{ secrets.QGENDA_ICS_URL }}
+          PERSONAL_CALENDARS: ${{ secrets.PERSONAL_CALENDARS }}
+          PERSONAL_ICS_URL: ${{ secrets.PERSONAL_ICS_URL }}
+          
+          # Weather location
+          WEATHER_LAT: ${{ vars.WEATHER_LAT || '38.03' }}
+          WEATHER_LON: ${{ vars.WEATHER_LON || '-78.48' }}
+          WEATHER_UNIT: ${{ vars.WEATHER_UNIT || 'fahrenheit' }}
+          
+          # RSS feeds
+          RSS_FEEDS: ${{ vars.RSS_FEEDS || 'https://www.nejm.org/action/showFeed?jc=nejm&type=etoc&feed=rss' }}
+          
+          # Notification method
+          NOTIFY_METHOD: ${{ vars.NOTIFY_METHOD || 'pushover' }}
+          
+          # Pushover
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+          
+          # Ntfy
+          NTFY_TOPIC: ${{ vars.NTFY_TOPIC || '' }}
+          NTFY_SERVER: ${{ vars.NTFY_SERVER || 'https://ntfy.sh' }}
+          
+          # Timezone
+          TIMEZONE_OFFSET_HOURS: ${{ vars.TIMEZONE_OFFSET_HOURS || '-4' }}
+        
+        run: python morning_briefing.py
